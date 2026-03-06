@@ -12,16 +12,36 @@
     aggregatedEventsCount: 0,
     status: 'idle',
     pageSize: 500,
+    filterSignature: null,
+    requestId: null,
     requestKey: null,
     viewKey: null,
   };
-  const viewCache = new Map();
-  const tableSignatureIndex = new Map();
+  const filterCache = new Map();
   let assignedEvents = new Set();
   let processedRows = new Set();
   let observer = null;
   let retryInterval = null;
   let loadingFallbackTimeout = null;
+  let forcedRefreshTimeout = null;
+  let currentFilterSignature = null;
+  let minAcceptedRequestId = 0;
+  let pendingPresetSignature = null;
+  let presetLockUntil = 0;
+  const MONTH_INDEX = {
+    jan: 0,
+    feb: 1,
+    mar: 2,
+    apr: 3,
+    may: 4,
+    jun: 5,
+    jul: 6,
+    aug: 7,
+    sep: 8,
+    oct: 9,
+    nov: 10,
+    dec: 11,
+  };
 
   const formatCents = (cents) => {
     if (cents == null) return '-';
@@ -42,6 +62,112 @@
   };
 
   const isSettledTotalStatus = (status) => status === 'ready' || status === 'partial';
+
+  const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+
+  const debugLog = () => {};
+
+  const publishDebugState = () => {};
+
+  const getRangeForFilterSignature = (filterSignature) => {
+    if (!filterSignature) return null;
+
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+    if (filterSignature === 'preset:1d' || filterSignature === 'preset:7d' || filterSignature === 'preset:30d') {
+      const days = Number(filterSignature.match(/\d+/)?.[0] || 0);
+      if (!days) return null;
+
+      const start = new Date(today);
+      start.setDate(start.getDate() - (days - 1));
+      const end = new Date(today);
+      end.setHours(23, 59, 59, 999);
+      return {
+        startDateMs: start.getTime(),
+        endDateMs: end.getTime(),
+      };
+    }
+
+    if (!filterSignature.startsWith('range:')) return null;
+
+    const label = filterSignature.slice('range:'.length).trim();
+    const match = label.match(/^([A-Za-z]{3})\s+(\d{1,2})\s*-\s*([A-Za-z]{3})\s+(\d{1,2})$/);
+    if (!match) return null;
+
+    const [, startMonthLabel, startDayText, endMonthLabel, endDayText] = match;
+    const startMonth = MONTH_INDEX[startMonthLabel.toLowerCase()];
+    const endMonth = MONTH_INDEX[endMonthLabel.toLowerCase()];
+    if (startMonth == null || endMonth == null) return null;
+
+    let endYear = today.getFullYear();
+    let startYear = endYear;
+    if (startMonth > endMonth) {
+      startYear -= 1;
+    }
+
+    const start = new Date(startYear, startMonth, Number(startDayText), 0, 0, 0, 0);
+    const end = new Date(endYear, endMonth, Number(endDayText), 23, 59, 59, 999);
+    return {
+      startDateMs: start.getTime(),
+      endDateMs: end.getTime(),
+    };
+  };
+
+  const getCurrentFilterSignature = () => {
+    if (!isUsageRoute()) return null;
+
+    const controlsRoot = document.querySelector('.dashboard-segmented-control')?.parentElement || document;
+    const activePreset = normalizeText(
+      controlsRoot.querySelector('.dashboard-segmented-control-option-active')?.textContent || ''
+    );
+    const dateLabel = normalizeText(
+      controlsRoot.querySelector('.dashboard-tabular-nums')?.textContent || ''
+    );
+
+    if (activePreset) return `preset:${activePreset.toLowerCase()}`;
+    if (dateLabel) return `range:${dateLabel}`;
+    return null;
+  };
+
+  const getPresetSignatureFromElement = (element) => {
+    const button = element?.closest?.('.dashboard-segmented-control-option');
+    if (!button) return null;
+
+    const label = normalizeText(button.textContent || '');
+    if (!label) return null;
+    return `preset:${label.toLowerCase()}`;
+  };
+
+  const getLatestStartedRequestId = () => {
+    const value = Number(window.__cursorUsageLatestStartedRequestId);
+    return Number.isFinite(value) ? value : 0;
+  };
+
+  const getRequestPathFromKey = (requestKey) => {
+    if (!requestKey || typeof requestKey !== 'string') return null;
+
+    try {
+      const parsed = JSON.parse(requestKey);
+      return typeof parsed?.path === 'string' ? parsed.path : null;
+    } catch (e) {
+      return null;
+    }
+  };
+
+  const isUsageEventsRequestPath = (requestPath) =>
+    /get-filtered-usage-events|get-usage-events/.test(requestPath || '');
+
+  const isRelevantUsagePayload = (data) => {
+    if (!data || typeof data !== 'object') return false;
+
+    const requestPath = getRequestPathFromKey(data.requestKey);
+    if (isUsageEventsRequestPath(requestPath)) return true;
+
+    if (!data.filterSignature) return false;
+    if (!currentFilterSignature) return true;
+    return data.filterSignature === currentFilterSignature || data.filterSignature === pendingPresetSignature;
+  };
 
   const getEventIdentity = (event, index) => {
     const parts = [
@@ -73,14 +199,20 @@
     });
   };
 
-  const updateViewCache = () => {
-    const viewKey = totalStore.viewKey || store.viewKey;
-    if (!viewKey) return;
+  const getToolbarContainer = () => {
+    const exportButton = Array.from(document.querySelectorAll('button')).find((button) =>
+      /export csv/i.test(button.textContent || '')
+    );
 
-    const existing = viewCache.get(viewKey) || {};
+    return exportButton?.parentElement?.parentElement || exportButton?.parentElement || null;
+  };
+
+  const cacheCurrentFilterState = () => {
+    const filterSignature = totalStore.filterSignature || currentFilterSignature;
+    if (!filterSignature) return;
+
+    const existing = filterCache.get(filterSignature) || {};
     const next = {
-      viewKey,
-      requestKey: totalStore.requestKey || existing.requestKey || null,
       events: store.events.length ? store.events.slice() : existing.events || [],
       total: existing.total || null,
     };
@@ -96,97 +228,60 @@
     }
 
     if (next.events.length || next.total) {
-      viewCache.set(viewKey, next);
+      filterCache.set(filterSignature, next);
+      debugLog('cache:write', {
+        filterSignature,
+        eventCount: next.events.length,
+        hasTotal: Boolean(next.total),
+        totalStatus: next.total?.status || null,
+      });
     }
   };
 
-  const getRenderableRows = () => {
-    const seen = new Set();
-    const rows = [];
-
-    document.querySelectorAll('[role="row"], .dashboard-table-row').forEach((row) => {
-      if (!row || seen.has(row)) return;
-      seen.add(row);
-
-      if (row.querySelector('[role="columnheader"], .dashboard-table-header')) return;
-      if (!row.querySelector('[role="cell"], .dashboard-table-cell')) return;
-
-      rows.push(row);
-    });
-
-    return rows;
-  };
-
-  const normalizeText = (value) => value.replace(/\s+/g, ' ').trim();
-
-  const getRowSignature = (row) => {
-    const clone = row.cloneNode(true);
-    clone.querySelectorAll('.cursor-cost-inline').forEach((el) => el.remove());
-
-    const titles = Array.from(row.querySelectorAll('[title]'))
-      .slice(0, 4)
-      .map((el) => normalizeText(el.getAttribute('title') || ''))
-      .filter(Boolean);
-    const text = normalizeText(clone.textContent || '');
-
-    if (!text) return null;
-    return titles.length ? `${titles.join('|')}::${text}` : text;
-  };
-
-  const getTableSignature = () => {
-    const rows = getRenderableRows();
-    if (rows.length < 2) return null;
-
-    const rowSignatures = rows
-      .slice(0, Math.min(rows.length, 8))
-      .map((row) => getRowSignature(row))
-      .filter(Boolean);
-
-    if (rowSignatures.length < 2) return null;
-
-    return JSON.stringify({
-      rowCount: rows.length,
-      rows: rowSignatures,
-    });
-  };
-
-  const restoreCachedViewFromSignature = (tableSignature) => {
-    if (!tableSignature) return false;
-
-    const cachedViewKey = tableSignatureIndex.get(tableSignature);
-    if (!cachedViewKey || cachedViewKey === totalStore.viewKey) return false;
-
-    const cachedView = viewCache.get(cachedViewKey);
-    if (!cachedView?.events?.length) return false;
-
-    store.events = cachedView.events.slice();
-    store.viewKey = cachedViewKey;
-    totalStore.viewKey = cachedViewKey;
-    totalStore.requestKey = cachedView.requestKey || null;
-
-    if (cachedView.total) {
-      totalStore.totalCostCents = cachedView.total.totalCostCents ?? null;
-      totalStore.totalEvents = cachedView.total.totalEvents ?? cachedView.events.length;
-      totalStore.aggregatedEventsCount = cachedView.total.aggregatedEventsCount ?? 0;
-      totalStore.status = cachedView.total.status || 'ready';
-      totalStore.pageSize = cachedView.total.pageSize || totalStore.pageSize;
-    } else {
-      totalStore.totalCostCents = null;
-      totalStore.totalEvents = cachedView.events.length;
-      totalStore.aggregatedEventsCount = 0;
-      totalStore.status = 'loading';
+  const applyCachedFilterState = (filterSignature) => {
+    const cached = filterCache.get(filterSignature);
+    if (!cached) {
+      debugLog('cache:miss', { filterSignature });
+      return false;
     }
 
     resetState();
+    store.events = cached.events ? cached.events.slice() : [];
+    store.viewKey = null;
+    totalStore.filterSignature = filterSignature;
+    totalStore.requestId = null;
+    totalStore.requestKey = null;
+    totalStore.viewKey = null;
+
+    if (cached.total) {
+      totalStore.totalCostCents = cached.total.totalCostCents ?? null;
+      totalStore.totalEvents = cached.total.totalEvents ?? 0;
+      totalStore.aggregatedEventsCount = cached.total.aggregatedEventsCount ?? 0;
+      totalStore.status = cached.total.status || 'ready';
+      totalStore.pageSize = cached.total.pageSize || totalStore.pageSize;
+      clearLoadingFallback();
+    } else {
+      totalStore.totalCostCents = null;
+      totalStore.totalEvents = 0;
+      totalStore.aggregatedEventsCount = 0;
+      totalStore.status = 'loading';
+      scheduleLoadingFallback();
+    }
+
+    renderTotalCost();
+    if (store.events.length) {
+      watchForTableChanges();
+    }
+
+    debugLog('cache:apply', {
+      filterSignature,
+      eventCount: store.events.length,
+      status: totalStore.status,
+      totalCostCents: totalStore.totalCostCents,
+    });
+    publishDebugState('cache:apply');
+
     return true;
-  };
-
-  const getToolbarContainer = () => {
-    const exportButton = Array.from(document.querySelectorAll('button')).find((button) =>
-      /export csv/i.test(button.textContent || '')
-    );
-
-    return exportButton?.parentElement?.parentElement || exportButton?.parentElement || null;
   };
 
   const renderTotalCost = () => {
@@ -244,6 +339,13 @@
     if (totalStore.status !== 'loading' || !store.events.length) return;
 
     const loadingViewKey = totalStore.viewKey;
+    debugLog('fallback:arm', {
+      filterSignature: totalStore.filterSignature,
+      requestId: totalStore.requestId,
+      loadingViewKey,
+      eventCount: store.events.length,
+      totalEvents: totalStore.totalEvents,
+    });
     loadingFallbackTimeout = setTimeout(() => {
       if (totalStore.status !== 'loading' || totalStore.viewKey !== loadingViewKey) return;
 
@@ -254,7 +356,15 @@
       totalStore.totalEvents = totalStore.totalEvents || store.events.length;
       totalStore.aggregatedEventsCount = store.events.length;
       totalStore.status = 'partial';
-      updateViewCache();
+      cacheCurrentFilterState();
+      debugLog('fallback:fire', {
+        filterSignature: totalStore.filterSignature,
+        requestId: totalStore.requestId,
+        totalCostCents: totalStore.totalCostCents,
+        aggregatedEventsCount: totalStore.aggregatedEventsCount,
+        totalEvents: totalStore.totalEvents,
+      });
+      publishDebugState('fallback:fire');
       renderTotalCost();
     }, 4000);
   };
@@ -302,8 +412,6 @@
   };
 
   const injectIntoTable = () => {
-    const tableSignature = getTableSignature();
-    restoreCachedViewFromSignature(tableSignature);
     renderTotalCost();
     if (!store.events.length) return;
 
@@ -342,11 +450,6 @@
           processedRows.add(rowId);
         });
       });
-
-    updateViewCache();
-    if (tableSignature && (totalStore.viewKey || store.viewKey)) {
-      tableSignatureIndex.set(tableSignature, totalStore.viewKey || store.viewKey);
-    }
   };
 
   const resetState = () => {
@@ -360,6 +463,7 @@
 
     if (!observer) {
       observer = new MutationObserver((mutations) => {
+        handleFilterSignatureChange();
         const shouldInject = mutations.some((m) =>
           Array.from(m.addedNodes).some(
             (n) =>
@@ -383,16 +487,54 @@
 
   const processApiResponse = (data) => {
     if (!data || typeof data !== 'object') return;
+    if (!isRelevantUsagePayload(data)) {
+      debugLog('api:ignore-irrelevant', {
+        requestId: data.requestId ?? null,
+        filterSignature: data.filterSignature || null,
+        requestPath: getRequestPathFromKey(data.requestKey),
+      });
+      return;
+    }
 
     const events = data.events || data.usageEventsDisplay || [];
     const totalEvents = data.totalEvents ?? events.length;
+    const requestId = data.requestId ?? null;
     const requestKey = data.requestKey || null;
     const viewKey = getViewKey(data, events, totalEvents);
-    const cachedView = viewCache.get(viewKey);
-    const hasSettledTotalForSameView =
-      viewKey && totalStore.viewKey === viewKey && isSettledTotalStatus(totalStore.status);
+    if (requestId != null && requestId < minAcceptedRequestId) {
+      debugLog('api:reject-old-request', {
+        requestId,
+        minAcceptedRequestId,
+        filterSignature: data.filterSignature || null,
+        totalEvents,
+        eventCount: events.length,
+      });
+      return;
+    }
+    const hasSettledTotalForSameRequest =
+      (requestId != null && totalStore.requestId === requestId && isSettledTotalStatus(totalStore.status)) ||
+      (requestId == null &&
+        viewKey &&
+        totalStore.viewKey === viewKey &&
+        isSettledTotalStatus(totalStore.status));
     const shouldRender = isUsageRoute();
 
+    if (!currentFilterSignature && data.filterSignature) {
+      currentFilterSignature = data.filterSignature;
+    }
+    if (pendingPresetSignature && data.filterSignature === pendingPresetSignature) {
+      clearPresetLock('api-response');
+    }
+    debugLog('api:accept', {
+      requestId,
+      requestKey,
+      filterSignature: currentFilterSignature,
+      totalEvents,
+      eventCount: events.length,
+      hasSettledTotalForSameRequest,
+    });
+    totalStore.filterSignature = currentFilterSignature;
+    totalStore.requestId = requestId;
     store.viewKey = viewKey;
     totalStore.viewKey = viewKey;
     totalStore.requestKey = requestKey;
@@ -402,13 +544,7 @@
       totalStore.totalEvents = 0;
       totalStore.aggregatedEventsCount = 0;
       totalStore.status = 'ready';
-    } else if (cachedView?.total) {
-      totalStore.totalCostCents = cachedView.total.totalCostCents ?? null;
-      totalStore.totalEvents = totalEvents;
-      totalStore.aggregatedEventsCount = cachedView.total.aggregatedEventsCount ?? 0;
-      totalStore.status = cachedView.total.status || 'ready';
-      totalStore.pageSize = cachedView.total.pageSize || totalStore.pageSize;
-    } else if (!hasSettledTotalForSameView) {
+    } else if (!hasSettledTotalForSameRequest) {
       // Clear stale totals only when the active request actually changed.
       totalStore.totalCostCents = null;
       totalStore.totalEvents = totalEvents;
@@ -431,13 +567,15 @@
     if (!events.length) {
       resetState();
       store.events = [];
-      updateViewCache();
+      cacheCurrentFilterState();
+      publishDebugState('api:empty');
       return;
     }
 
     resetState();
     store.events = events;
-    updateViewCache();
+    cacheCurrentFilterState();
+    publishDebugState('api:accept');
 
     if (totalStore.status === 'loading') {
       scheduleLoadingFallback();
@@ -450,9 +588,64 @@
 
   const processTotalResponse = (data) => {
     if (!data || typeof data !== 'object') return;
-    if (totalStore.viewKey && data.viewKey && totalStore.viewKey !== data.viewKey) return;
-    if (totalStore.requestKey && data.requestKey && totalStore.requestKey !== data.requestKey) return;
+    if (!isRelevantUsagePayload(data)) {
+      debugLog('total:ignore-irrelevant', {
+        requestId: data.requestId ?? null,
+        filterSignature: data.filterSignature || null,
+        requestPath: getRequestPathFromKey(data.requestKey),
+        status: data.status || null,
+      });
+      return;
+    }
+    if (data.requestId != null && data.requestId < minAcceptedRequestId) {
+      debugLog('total:reject-old-request', {
+        requestId: data.requestId,
+        minAcceptedRequestId,
+        status: data.status || null,
+        filterSignature: data.filterSignature || null,
+      });
+      return;
+    }
+    if (totalStore.requestId != null && data.requestId != null && totalStore.requestId !== data.requestId) {
+      debugLog('total:reject-request-mismatch', {
+        incomingRequestId: data.requestId,
+        activeRequestId: totalStore.requestId,
+        status: data.status || null,
+      });
+      return;
+    }
+    if (totalStore.viewKey && data.viewKey && totalStore.viewKey !== data.viewKey) {
+      debugLog('total:reject-view-mismatch', {
+        incomingRequestId: data.requestId ?? null,
+        incomingViewKey: data.viewKey,
+        activeViewKey: totalStore.viewKey,
+      });
+      return;
+    }
+    if (totalStore.requestKey && data.requestKey && totalStore.requestKey !== data.requestKey) {
+      debugLog('total:reject-request-key-mismatch', {
+        incomingRequestId: data.requestId ?? null,
+        activeRequestId: totalStore.requestId,
+      });
+      return;
+    }
 
+    if (!currentFilterSignature && data.filterSignature) {
+      currentFilterSignature = data.filterSignature;
+    }
+    if (pendingPresetSignature && data.filterSignature === pendingPresetSignature) {
+      clearPresetLock('total-response');
+    }
+    debugLog('total:accept', {
+      requestId: data.requestId ?? null,
+      filterSignature: currentFilterSignature,
+      status: data.status || null,
+      totalCostCents: data.totalCostCents != null ? data.totalCostCents : null,
+      aggregatedEventsCount: data.aggregatedEventsCount ?? 0,
+      totalEvents: data.totalEvents ?? 0,
+    });
+    totalStore.filterSignature = currentFilterSignature;
+    totalStore.requestId = data.requestId ?? totalStore.requestId ?? null;
     totalStore.viewKey = data.viewKey || totalStore.viewKey || null;
     totalStore.requestKey = data.requestKey || totalStore.requestKey || null;
     totalStore.totalCostCents = data.totalCostCents ?? null;
@@ -465,7 +658,8 @@
     } else if (isSettledTotalStatus(totalStore.status) || totalStore.status === 'idle') {
       clearLoadingFallback();
     }
-    updateViewCache();
+    cacheCurrentFilterState();
+    publishDebugState('total:accept');
 
     if (!isUsageRoute()) return;
 
@@ -488,13 +682,164 @@
     }
   };
 
-  const scheduleUsageStateSync = () => {
-    syncUsageStateFromWindow();
-    [250, 1000, 2500].forEach((delay) => {
+  const scheduleUsageStateSync = (runImmediately = true) => {
+    if (runImmediately) {
+      syncUsageStateFromWindow();
+    }
+    [100, 250, 1000, 2500].forEach((delay) => {
       setTimeout(() => {
         syncUsageStateFromWindow();
       }, delay);
     });
+  };
+
+  const clearPresetLock = (reason) => {
+    if (!pendingPresetSignature && presetLockUntil === 0) return;
+    debugLog('filter:clear-preset-lock', {
+      reason,
+      pendingPresetSignature,
+    });
+    pendingPresetSignature = null;
+    presetLockUntil = 0;
+  };
+
+  const scheduleForcedRefresh = (filterSignature, delay = 75) => {
+    if (forcedRefreshTimeout) {
+      clearTimeout(forcedRefreshTimeout);
+      forcedRefreshTimeout = null;
+    }
+
+    if (!filterSignature) return;
+
+    forcedRefreshTimeout = setTimeout(() => {
+      forcedRefreshTimeout = null;
+
+      if (filterSignature !== currentFilterSignature) {
+        debugLog('force:skip-stale-filter', {
+          scheduledFor: filterSignature,
+          currentFilterSignature,
+        });
+        return;
+      }
+
+      const range = getRangeForFilterSignature(filterSignature);
+      if (!range) {
+        debugLog('force:skip-no-range', { filterSignature });
+        return;
+      }
+
+      if (typeof window.__cursorTokenPricesForceRefresh !== 'function') {
+        debugLog('force:skip-no-hook', { filterSignature });
+        return;
+      }
+
+      debugLog('force:request', {
+        filterSignature,
+        startDateMs: range.startDateMs,
+        endDateMs: range.endDateMs,
+      });
+
+      Promise.resolve(
+        window.__cursorTokenPricesForceRefresh({
+          filterSignature,
+          startDateMs: range.startDateMs,
+          endDateMs: range.endDateMs,
+        })
+      ).then((ok) => {
+        debugLog('force:result', { filterSignature, ok: Boolean(ok) });
+      });
+    }, delay);
+  };
+
+  const handleFilterSignatureChange = () => {
+    if (!isUsageRoute()) return;
+
+    const nextFilterSignature = getCurrentFilterSignature();
+    if (!nextFilterSignature) return;
+
+    if (pendingPresetSignature) {
+      if (nextFilterSignature === pendingPresetSignature) {
+        clearPresetLock('dom-matched-preset');
+      } else if (Date.now() < presetLockUntil) {
+        debugLog('filter:ignore-dom-during-preset-lock', {
+          domFilterSignature: nextFilterSignature,
+          pendingPresetSignature,
+          currentFilterSignature,
+        });
+        return;
+      } else {
+        clearPresetLock('preset-lock-timeout');
+      }
+    }
+
+    if (currentFilterSignature == null) {
+      currentFilterSignature = nextFilterSignature;
+      totalStore.filterSignature = nextFilterSignature;
+      debugLog('filter:init', { nextFilterSignature });
+      return;
+    }
+
+    if (nextFilterSignature === currentFilterSignature) return;
+
+    debugLog('filter:change', {
+      from: currentFilterSignature,
+      to: nextFilterSignature,
+      latestStartedRequestId: getLatestStartedRequestId(),
+    });
+    currentFilterSignature = nextFilterSignature;
+    totalStore.filterSignature = nextFilterSignature;
+    minAcceptedRequestId = getLatestStartedRequestId() + 1;
+    totalStore.requestId = null;
+    totalStore.requestKey = null;
+    totalStore.viewKey = null;
+    store.viewKey = null;
+    clearLoadingFallback();
+
+    if (!applyCachedFilterState(nextFilterSignature)) {
+      resetState();
+      store.events = [];
+      totalStore.totalCostCents = null;
+      totalStore.totalEvents = 0;
+      totalStore.aggregatedEventsCount = 0;
+      totalStore.status = 'loading';
+      renderTotalCost();
+    }
+
+    publishDebugState('filter:change');
+    scheduleUsageStateSync(false);
+    scheduleForcedRefresh(nextFilterSignature);
+  };
+
+  const setActiveFilterSignature = (nextFilterSignature) => {
+    if (!isUsageRoute() || !nextFilterSignature || nextFilterSignature === currentFilterSignature) return;
+
+    debugLog('filter:preset-click', {
+      from: currentFilterSignature,
+      to: nextFilterSignature,
+      latestStartedRequestId: getLatestStartedRequestId(),
+    });
+    currentFilterSignature = nextFilterSignature;
+    pendingPresetSignature = nextFilterSignature;
+    presetLockUntil = Date.now() + 1500;
+    totalStore.filterSignature = nextFilterSignature;
+    minAcceptedRequestId = getLatestStartedRequestId() + 1;
+    totalStore.requestId = null;
+    totalStore.requestKey = null;
+    totalStore.viewKey = null;
+    store.viewKey = null;
+    clearLoadingFallback();
+
+    if (!applyCachedFilterState(nextFilterSignature)) {
+      resetState();
+      store.events = [];
+      totalStore.totalCostCents = null;
+      totalStore.totalEvents = 0;
+      totalStore.aggregatedEventsCount = 0;
+      totalStore.status = 'loading';
+      renderTotalCost();
+    }
+    publishDebugState('filter:preset-click');
+    scheduleForcedRefresh(nextFilterSignature);
   };
 
   let lastUrl = window.location.href;
@@ -508,7 +853,26 @@
       return;
     }
 
+    currentFilterSignature = getCurrentFilterSignature();
+    totalStore.filterSignature = currentFilterSignature;
+    minAcceptedRequestId = 0;
+    clearPresetLock('route-change');
+    debugLog('route:usage', { currentFilterSignature });
+    if (!applyCachedFilterState(currentFilterSignature)) {
+      resetState();
+      store.events = [];
+      store.viewKey = null;
+      totalStore.totalCostCents = null;
+      totalStore.totalEvents = 0;
+      totalStore.aggregatedEventsCount = 0;
+      totalStore.status = 'loading';
+      totalStore.requestId = null;
+      totalStore.requestKey = null;
+      totalStore.viewKey = null;
+      renderTotalCost();
+    }
     scheduleUsageStateSync();
+    scheduleForcedRefresh(currentFilterSignature, 150);
   };
 
   const patchHistoryMethod = (methodName) => {
@@ -525,6 +889,28 @@
   window.addEventListener('cursor-usage-total-data', (e) => processTotalResponse(e.detail));
   window.addEventListener('popstate', handleRouteChange);
   window.addEventListener('hashchange', handleRouteChange);
+  document.addEventListener(
+    'click',
+    (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const presetSignature = getPresetSignatureFromElement(target);
+      if (presetSignature) {
+        setActiveFilterSignature(presetSignature);
+        scheduleUsageStateSync(false);
+        return;
+      }
+
+      if (!target.closest('.dashboard-segmented-control, .dashboard-outline-button')) return;
+
+      [0, 50, 150, 400].forEach((delay) => {
+        setTimeout(() => {
+          handleFilterSignatureChange();
+        }, delay);
+      });
+    },
+    true
+  );
   patchHistoryMethod('pushState');
   patchHistoryMethod('replaceState');
 
@@ -532,6 +918,10 @@
     processTotalResponse(window.__cursorUsageTotalData);
   }
 
+  currentFilterSignature = getCurrentFilterSignature();
+  totalStore.filterSignature = currentFilterSignature;
+  minAcceptedRequestId = 0;
+  clearPresetLock('initialize');
   if (hasUsageData(window.__cursorUsageData)) {
     processApiResponse(window.__cursorUsageData);
     return;

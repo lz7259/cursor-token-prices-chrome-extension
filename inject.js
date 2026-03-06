@@ -18,11 +18,22 @@
       ];
 
       let aggregationRunId = 0;
+      let nextRequestId = 0;
+      let latestUsageEventsRequestDetails = null;
+      window.__cursorUsageLatestStartedRequestId = 0;
+
+      function debugLog() {}
 
       function isApiUrl(url) {
         if (!url) return false;
         const urlString = typeof url === 'string' ? url : url?.url || url?.toString?.() || '';
         return API_PATTERNS.some((p) => p.test(urlString));
+      }
+
+      function isUsageEventsUrl(url) {
+        if (!url) return false;
+        const urlString = typeof url === 'string' ? url : url?.url || url?.toString?.() || '';
+        return /get-filtered-usage-events|get-usage-events/.test(urlString);
       }
 
       function headersToObject(headersInit) {
@@ -89,6 +100,73 @@
         return 'fallback|' + index + '|' + JSON.stringify(event || {});
       }
 
+      function normalizeText(value) {
+        return String(value || '').replace(/\s+/g, ' ').trim();
+      }
+
+      function getFilterSignature() {
+        var controlsRoot = document.querySelector('.dashboard-segmented-control')?.parentElement || document;
+        var activePreset = normalizeText(
+          controlsRoot.querySelector('.dashboard-segmented-control-option-active')?.textContent || ''
+        );
+        var dateLabel = normalizeText(
+          controlsRoot.querySelector('.dashboard-tabular-nums')?.textContent || ''
+        );
+
+        if (activePreset) return 'preset:' + activePreset.toLowerCase();
+        if (dateLabel) return 'range:' + dateLabel;
+        return null;
+      }
+
+      function cloneRequestDetails(requestDetails) {
+        if (!requestDetails) return null;
+        return {
+          url: requestDetails.url,
+          method: requestDetails.method,
+          headers: { ...(requestDetails.headers || {}) },
+          body: requestDetails.body,
+        };
+      }
+
+      function setRangeOnRequestDetails(requestDetails, range) {
+        if (!requestDetails || !range) return requestDetails;
+
+        const next = cloneRequestDetails(requestDetails);
+        const startDate = String(range.startDateMs);
+        const endDate = String(range.endDateMs);
+        const body = parseJson(next.body);
+
+        if (body && typeof body === 'object' && !Array.isArray(body)) {
+          body.startDate = startDate;
+          body.endDate = endDate;
+          next.body = JSON.stringify(body);
+          return next;
+        }
+
+        const url = new URL(next.url, window.location.origin);
+        url.searchParams.set('startDate', startDate);
+        url.searchParams.set('endDate', endDate);
+        next.url = url.toString();
+        return next;
+      }
+
+      function toFetchRequest(requestDetails) {
+        const options = {
+          method: requestDetails.method,
+          headers: { ...(requestDetails.headers || {}) },
+          credentials: 'same-origin',
+        };
+
+        if (!['GET', 'HEAD'].includes(requestDetails.method) && requestDetails.body != null) {
+          options.body = requestDetails.body;
+        }
+
+        return {
+          url: requestDetails.url,
+          options: options,
+        };
+      }
+
       function getViewKey(data, requestKey) {
         const events = data && data.events || [];
         const totalEvents = data && data.totalEvents || events.length;
@@ -120,11 +198,25 @@
 
       function dispatchData(data) {
         window.__cursorUsageData = data;
+        debugLog('dispatch:data', {
+          requestId: data && data.requestId || null,
+          filterSignature: data && data.filterSignature || null,
+          eventCount: data && data.events && data.events.length || 0,
+          totalEvents: data && data.totalEvents || 0,
+        });
         window.dispatchEvent(new CustomEvent('cursor-usage-data', { detail: data }));
       }
 
       function dispatchTotalData(data) {
         window.__cursorUsageTotalData = data;
+        debugLog('dispatch:total', {
+          requestId: data && data.requestId || null,
+          filterSignature: data && data.filterSignature || null,
+          status: data && data.status || null,
+          aggregatedEventsCount: data && data.aggregatedEventsCount || 0,
+          totalEvents: data && data.totalEvents || 0,
+          totalCostCents: data && data.totalCostCents != null ? data.totalCostCents : null,
+        });
         window.dispatchEvent(new CustomEvent('cursor-usage-total-data', { detail: data }));
       }
 
@@ -244,11 +336,17 @@
         return { url: url.toString(), options };
       }
 
-      async function aggregateTotal(originalFetch, requestDetails, baseData, requestKey) {
+      async function aggregateTotal(originalFetch, requestDetails, baseData, requestKey, requestId, filterSignature) {
         const runId = ++aggregationRunId;
         const totalEvents = baseData.totalEvents || baseData.events.length;
         const effectiveRequestKey = requestKey || getRequestKey(requestDetails);
         const effectiveViewKey = getViewKey(baseData, effectiveRequestKey);
+        debugLog('aggregate:start', {
+          requestId: requestId,
+          filterSignature: filterSignature,
+          totalEvents: totalEvents,
+          baseEventCount: baseData && baseData.events && baseData.events.length || 0,
+        });
 
         if (!totalEvents) {
           if (runId !== aggregationRunId) return;
@@ -260,6 +358,8 @@
             pageSize: AGGREGATION_PAGE_SIZE,
             requestKey: effectiveRequestKey,
             viewKey: effectiveViewKey,
+            requestId: requestId,
+            filterSignature: filterSignature,
           });
           return;
         }
@@ -274,6 +374,8 @@
             pageSize: AGGREGATION_PAGE_SIZE,
             requestKey: effectiveRequestKey,
             viewKey: effectiveViewKey,
+            requestId: requestId,
+            filterSignature: filterSignature,
           });
           return;
         }
@@ -289,6 +391,8 @@
             pageSize: AGGREGATION_PAGE_SIZE,
             requestKey: effectiveRequestKey,
             viewKey: effectiveViewKey,
+            requestId: requestId,
+            filterSignature: filterSignature,
           });
           return;
         }
@@ -301,6 +405,8 @@
           pageSize: AGGREGATION_PAGE_SIZE,
           requestKey: effectiveRequestKey,
           viewKey: effectiveViewKey,
+          requestId: requestId,
+          filterSignature: filterSignature,
         });
 
         const totalPages = Math.max(1, Math.ceil(totalEvents / AGGREGATION_PAGE_SIZE));
@@ -326,6 +432,12 @@
 
             if (pageData.events.length < AGGREGATION_PAGE_SIZE) break;
           } catch (e) {
+            debugLog('aggregate:error', {
+              requestId: requestId,
+              filterSignature: filterSignature,
+              pageIndex: pageIndex,
+              error: e && e.message || String(e),
+            });
             break;
           }
         }
@@ -340,11 +452,71 @@
           pageSize: AGGREGATION_PAGE_SIZE,
           requestKey: effectiveRequestKey,
           viewKey: effectiveViewKey,
+          requestId: requestId,
+          filterSignature: filterSignature,
         });
       }
 
       const originalFetch = window.fetch;
+      window.__cursorTokenPricesForceRefresh = async function (params) {
+        try {
+          if (!latestUsageEventsRequestDetails || !params) {
+            debugLog('force:skip-no-template', { hasTemplate: Boolean(latestUsageEventsRequestDetails), params: params || null });
+            return false;
+          }
+
+          const forcedRequestDetails = setRangeOnRequestDetails(latestUsageEventsRequestDetails, params);
+          const requestId = ++nextRequestId;
+          window.__cursorUsageLatestStartedRequestId = requestId;
+          const requestKey = getRequestKey(forcedRequestDetails);
+          const filterSignature = params.filterSignature || getFilterSignature();
+          const config = getAggregationConfig(forcedRequestDetails);
+          const request = config
+            ? buildAggregationRequest(forcedRequestDetails, config, config.startPage)
+            : toFetchRequest(forcedRequestDetails);
+
+          debugLog('force:start', {
+            requestId: requestId,
+            filterSignature: filterSignature,
+            startDateMs: params.startDateMs,
+            endDateMs: params.endDateMs,
+            url: request.url,
+          });
+
+          const response = await originalFetch(request.url, request.options);
+          if (!response.ok) {
+            debugLog('force:http-error', { requestId: requestId, status: response.status });
+            return false;
+          }
+
+          const data = extractEvents(await response.json());
+          const viewKey = getViewKey(data, requestKey);
+          dispatchData({
+            ...data,
+            requestKey: requestKey,
+            viewKey: viewKey,
+            requestId: requestId,
+            filterSignature: filterSignature,
+          });
+
+          await aggregateTotal(originalFetch, forcedRequestDetails, data, requestKey, requestId, filterSignature);
+          return true;
+        } catch (e) {
+          debugLog('force:error', { error: e && e.message || String(e), params: params || null });
+          return false;
+        }
+      };
       window.fetch = async function (...args) {
+        const requestId = ++nextRequestId;
+        window.__cursorUsageLatestStartedRequestId = requestId;
+        const filterSignature = getFilterSignature();
+        if (isApiUrl(args[0])) {
+          debugLog('fetch:start', {
+            requestId: requestId,
+            filterSignature: filterSignature,
+            url: typeof args[0] === 'string' ? args[0] : args[0] && args[0].url || '',
+          });
+        }
         const response = await originalFetch.apply(this, args);
         const url = args[0];
 
@@ -356,15 +528,23 @@
             try {
               requestDetails = await normalizeFetchRequest(args);
               requestKey = getRequestKey(requestDetails);
+              if (isUsageEventsUrl(requestDetails.url)) {
+                latestUsageEventsRequestDetails = cloneRequestDetails(requestDetails);
+              }
             } catch (e) {}
             const viewKey = getViewKey(data, requestKey);
-
-            dispatchData({ ...data, requestKey: requestKey, viewKey: viewKey });
+            dispatchData({
+              ...data,
+              requestKey: requestKey,
+              viewKey: viewKey,
+              requestId: requestId,
+              filterSignature: filterSignature,
+            });
 
             Promise.resolve().then(async function () {
               try {
                 if (!requestDetails) requestDetails = await normalizeFetchRequest(args);
-                await aggregateTotal(originalFetch, requestDetails, data, requestKey);
+                await aggregateTotal(originalFetch, requestDetails, data, requestKey, requestId, filterSignature);
               } catch (e) {}
             });
           } catch (e) {}
@@ -392,6 +572,16 @@
       XMLHttpRequest.prototype.send = function (...args) {
         const xhr = this;
         xhr._body = typeof args[0] === 'string' ? args[0] : null;
+        xhr._filterSignature = getFilterSignature();
+        xhr._requestId = ++nextRequestId;
+        window.__cursorUsageLatestStartedRequestId = xhr._requestId;
+        if (isApiUrl(xhr._url)) {
+          debugLog('xhr:start', {
+            requestId: xhr._requestId,
+            filterSignature: xhr._filterSignature || null,
+            url: xhr._url,
+          });
+        }
 
         if (isApiUrl(xhr._url)) {
           const onReady = function () {
@@ -405,9 +595,17 @@
                   body: xhr._body,
                 };
                 const requestKey = getRequestKey(requestDetails);
+                if (isUsageEventsUrl(requestDetails.url)) {
+                  latestUsageEventsRequestDetails = cloneRequestDetails(requestDetails);
+                }
                 const viewKey = getViewKey(data, requestKey);
-
-                dispatchData({ ...data, requestKey: requestKey, viewKey: viewKey });
+                dispatchData({
+                  ...data,
+                  requestKey: requestKey,
+                  viewKey: viewKey,
+                  requestId: xhr._requestId,
+                  filterSignature: xhr._filterSignature || null,
+                });
 
                 Promise.resolve().then(async function () {
                   try {
@@ -415,7 +613,9 @@
                       originalFetch,
                       requestDetails,
                       data,
-                      requestKey
+                      requestKey,
+                      xhr._requestId,
+                      xhr._filterSignature || null
                     );
                   } catch (e) {}
                 });
