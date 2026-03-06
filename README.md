@@ -31,6 +31,8 @@ After code changes: reload on `chrome://extensions/` (Reload), then `Cmd+Shift+R
 4. Select this project's `manifest.json`
 5. Open [cursor.com/dashboard?tab=usage](https://cursor.com/dashboard?tab=usage)
 
+For a permanent local install in Firefox, open `about:config` and set `xpinstall.signatures.required` to `false` before installing the extension.
+
 After code changes: click **Reload** for the temporary add-on in `about:debugging`, then `Cmd+Shift+R` / `Ctrl+Shift+R` on the usage page.
 
 To rebuild the `.xpi` package:
