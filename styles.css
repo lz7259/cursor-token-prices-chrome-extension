@@ -16,8 +16,45 @@
   content: ')';
 }
 
+.cursor-total-cost {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 140px;
+  padding: 6px 10px;
+  border: 1px solid var(--border-tertiary, rgba(148, 163, 184, 0.3));
+  border-radius: 10px;
+  background: var(--bg-elevated, rgba(15, 23, 42, 0.04));
+}
+
+.cursor-total-cost-label {
+  color: var(--text-tertiary, #64748b);
+  font-size: 11px;
+  line-height: 1.2;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.cursor-total-cost-value {
+  color: var(--text-primary, #0f172a);
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.cursor-total-cost-meta {
+  color: var(--text-secondary, #64748b);
+  font-size: 11px;
+  line-height: 1.2;
+}
+
 @media (max-width: 768px) {
   .cursor-cost-inline {
     font-size: 10px;
+  }
+
+  .cursor-total-cost {
+    width: 100%;
+    min-width: 0;
   }
 }

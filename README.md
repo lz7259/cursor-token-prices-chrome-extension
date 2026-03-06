@@ -33,6 +33,12 @@ After code changes: reload on `chrome://extensions/` (Reload), then `Cmd+Shift+R
 
 After code changes: click **Reload** for the temporary add-on in `about:debugging`, then `Cmd+Shift+R` / `Ctrl+Shift+R` on the usage page.
 
+To rebuild the `.xpi` package:
+
+```bash
+zip -r "cursor-token-prices-firefox.xpi" manifest.json inject.js content.js styles.css icons LICENSE README.md
+```
+
 ## Debugging
 
 ```javascript

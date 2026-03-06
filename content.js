@@ -3,6 +3,13 @@
   'use strict';
 
   const store = { events: [] };
+  const totalStore = {
+    totalCostCents: null,
+    totalEvents: 0,
+    aggregatedEventsCount: 0,
+    status: 'idle',
+    pageSize: 500,
+  };
   let assignedEvents = new Set();
   let processedRows = new Set();
   let observer = null;
@@ -13,6 +20,51 @@
     if (cents === 0) return '$0.00';
     const dollars = cents / 100;
     return dollars < 0.01 ? `$${dollars.toFixed(3)}` : `$${dollars.toFixed(2)}`;
+  };
+
+  const getToolbarContainer = () => {
+    const exportButton = Array.from(document.querySelectorAll('button')).find((button) =>
+      /export csv/i.test(button.textContent || '')
+    );
+
+    return exportButton?.parentElement?.parentElement || exportButton?.parentElement || null;
+  };
+
+  const renderTotalCost = () => {
+    const toolbarContainer = getToolbarContainer();
+    if (!toolbarContainer) return;
+
+    let totalEl = toolbarContainer.querySelector('.cursor-total-cost');
+    const shouldShow =
+      totalStore.status === 'loading' ||
+      totalStore.status === 'partial' ||
+      (totalStore.status === 'ready' && totalStore.totalCostCents != null);
+
+    if (!shouldShow) {
+      totalEl?.remove();
+      return;
+    }
+
+    if (!totalEl) {
+      totalEl = document.createElement('div');
+      totalEl.className = 'cursor-total-cost';
+      toolbarContainer.insertBefore(totalEl, toolbarContainer.lastElementChild || null);
+    }
+
+    const valueText = totalStore.status === 'loading' ? 'Calculating...' : formatCents(totalStore.totalCostCents);
+    const metaText =
+      totalStore.status === 'loading'
+        ? `Fetching totals in ${totalStore.pageSize}-row pages`
+        : totalStore.status === 'partial'
+          ? `Summed ${totalStore.aggregatedEventsCount.toLocaleString()} of ${totalStore.totalEvents.toLocaleString()} requests`
+          : `Summed ${totalStore.aggregatedEventsCount.toLocaleString()} requests`;
+
+    totalEl.innerHTML = `
+      <span class="cursor-total-cost-label">Total cost</span>
+      <span class="cursor-total-cost-value">${valueText}</span>
+      <span class="cursor-total-cost-meta">${metaText}</span>
+    `;
+    totalEl.title = metaText;
   };
 
   const getRowId = (row, index) => {
@@ -58,6 +110,7 @@
   };
 
   const injectIntoTable = () => {
+    renderTotalCost();
     if (!store.events.length) return;
 
     document
@@ -141,8 +194,24 @@
     watchForTableChanges();
   };
 
+  const processTotalResponse = (data) => {
+    if (!data || typeof data !== 'object') return;
+
+    totalStore.totalCostCents = data.totalCostCents ?? null;
+    totalStore.totalEvents = data.totalEvents ?? 0;
+    totalStore.aggregatedEventsCount = data.aggregatedEventsCount ?? 0;
+    totalStore.status = data.status || 'idle';
+    totalStore.pageSize = data.pageSize || 500;
+    renderTotalCost();
+  };
+
   // Initialize
   window.addEventListener('cursor-usage-data', (e) => processApiResponse(e.detail));
+  window.addEventListener('cursor-usage-total-data', (e) => processTotalResponse(e.detail));
+
+  if (window.__cursorUsageTotalData) {
+    processTotalResponse(window.__cursorUsageTotalData);
+  }
 
   if (window.__cursorUsageData?.events?.length) {
     processApiResponse(window.__cursorUsageData);
