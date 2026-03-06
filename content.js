@@ -2,14 +2,21 @@
 (function () {
   'use strict';
 
-  const store = { events: [] };
+  const store = {
+    events: [],
+    viewKey: null,
+  };
   const totalStore = {
     totalCostCents: null,
     totalEvents: 0,
     aggregatedEventsCount: 0,
     status: 'idle',
     pageSize: 500,
+    requestKey: null,
+    viewKey: null,
   };
+  const viewCache = new Map();
+  const tableSignatureIndex = new Map();
   let assignedEvents = new Set();
   let processedRows = new Set();
   let observer = null;
@@ -20,6 +27,146 @@
     if (cents === 0) return '$0.00';
     const dollars = cents / 100;
     return dollars < 0.01 ? `$${dollars.toFixed(3)}` : `$${dollars.toFixed(2)}`;
+  };
+
+  const isSettledTotalStatus = (status) => status === 'ready' || status === 'partial';
+
+  const getEventIdentity = (event, index) => {
+    const parts = [
+      event?.requestId || '',
+      event?.timestamp || '',
+      event?.model || '',
+      event?.tokenUsage?.totalCents ?? '',
+      event?.tokenUsage?.inputTokens ?? '',
+      event?.tokenUsage?.outputTokens ?? '',
+      event?.tokenUsage?.cacheReadTokens ?? '',
+      event?.tokenUsage?.cacheWriteTokens ?? '',
+    ];
+    return parts.some(Boolean) ? parts.join('|') : `fallback|${index}|${JSON.stringify(event || {})}`;
+  };
+
+  const getViewKey = (data, events, totalEvents) => {
+    if (data?.viewKey) return data.viewKey;
+
+    const firstEvent = events.length ? getEventIdentity(events[0], 0) : '';
+    const lastIndex = events.length - 1;
+    const lastEvent = lastIndex >= 0 ? getEventIdentity(events[lastIndex], lastIndex) : '';
+
+    return JSON.stringify({
+      requestKey: data?.requestKey || null,
+      totalEvents,
+      pageSize: events.length,
+      firstEvent,
+      lastEvent,
+    });
+  };
+
+  const updateViewCache = () => {
+    const viewKey = totalStore.viewKey || store.viewKey;
+    if (!viewKey) return;
+
+    const existing = viewCache.get(viewKey) || {};
+    const next = {
+      viewKey,
+      requestKey: totalStore.requestKey || existing.requestKey || null,
+      events: store.events.length ? store.events.slice() : existing.events || [],
+      total: existing.total || null,
+    };
+
+    if (isSettledTotalStatus(totalStore.status)) {
+      next.total = {
+        totalCostCents: totalStore.totalCostCents,
+        totalEvents: totalStore.totalEvents,
+        aggregatedEventsCount: totalStore.aggregatedEventsCount,
+        status: totalStore.status,
+        pageSize: totalStore.pageSize,
+      };
+    }
+
+    if (next.events.length || next.total) {
+      viewCache.set(viewKey, next);
+    }
+  };
+
+  const getRenderableRows = () => {
+    const seen = new Set();
+    const rows = [];
+
+    document.querySelectorAll('[role="row"], .dashboard-table-row').forEach((row) => {
+      if (!row || seen.has(row)) return;
+      seen.add(row);
+
+      if (row.querySelector('[role="columnheader"], .dashboard-table-header')) return;
+      if (!row.querySelector('[role="cell"], .dashboard-table-cell')) return;
+
+      rows.push(row);
+    });
+
+    return rows;
+  };
+
+  const normalizeText = (value) => value.replace(/\s+/g, ' ').trim();
+
+  const getRowSignature = (row) => {
+    const clone = row.cloneNode(true);
+    clone.querySelectorAll('.cursor-cost-inline').forEach((el) => el.remove());
+
+    const titles = Array.from(row.querySelectorAll('[title]'))
+      .slice(0, 4)
+      .map((el) => normalizeText(el.getAttribute('title') || ''))
+      .filter(Boolean);
+    const text = normalizeText(clone.textContent || '');
+
+    if (!text) return null;
+    return titles.length ? `${titles.join('|')}::${text}` : text;
+  };
+
+  const getTableSignature = () => {
+    const rows = getRenderableRows();
+    if (rows.length < 2) return null;
+
+    const rowSignatures = rows
+      .slice(0, Math.min(rows.length, 8))
+      .map((row) => getRowSignature(row))
+      .filter(Boolean);
+
+    if (rowSignatures.length < 2) return null;
+
+    return JSON.stringify({
+      rowCount: rows.length,
+      rows: rowSignatures,
+    });
+  };
+
+  const restoreCachedViewFromSignature = (tableSignature) => {
+    if (!tableSignature) return false;
+
+    const cachedViewKey = tableSignatureIndex.get(tableSignature);
+    if (!cachedViewKey || cachedViewKey === totalStore.viewKey) return false;
+
+    const cachedView = viewCache.get(cachedViewKey);
+    if (!cachedView?.events?.length) return false;
+
+    store.events = cachedView.events.slice();
+    store.viewKey = cachedViewKey;
+    totalStore.viewKey = cachedViewKey;
+    totalStore.requestKey = cachedView.requestKey || null;
+
+    if (cachedView.total) {
+      totalStore.totalCostCents = cachedView.total.totalCostCents ?? null;
+      totalStore.totalEvents = cachedView.total.totalEvents ?? cachedView.events.length;
+      totalStore.aggregatedEventsCount = cachedView.total.aggregatedEventsCount ?? 0;
+      totalStore.status = cachedView.total.status || 'ready';
+      totalStore.pageSize = cachedView.total.pageSize || totalStore.pageSize;
+    } else {
+      totalStore.totalCostCents = null;
+      totalStore.totalEvents = cachedView.events.length;
+      totalStore.aggregatedEventsCount = 0;
+      totalStore.status = 'loading';
+    }
+
+    resetState();
+    return true;
   };
 
   const getToolbarContainer = () => {
@@ -110,6 +257,8 @@
   };
 
   const injectIntoTable = () => {
+    const tableSignature = getTableSignature();
+    restoreCachedViewFromSignature(tableSignature);
     renderTotalCost();
     if (!store.events.length) return;
 
@@ -148,6 +297,11 @@
           processedRows.add(rowId);
         });
       });
+
+    updateViewCache();
+    if (tableSignature && (totalStore.viewKey || store.viewKey)) {
+      tableSignatureIndex.set(tableSignature, totalStore.viewKey || store.viewKey);
+    }
   };
 
   const resetState = () => {
@@ -186,23 +340,68 @@
     if (!data || typeof data !== 'object') return;
 
     const events = data.events || data.usageEventsDisplay || [];
-    if (!events.length) return;
+    const totalEvents = data.totalEvents ?? events.length;
+    const requestKey = data.requestKey || null;
+    const viewKey = getViewKey(data, events, totalEvents);
+    const cachedView = viewCache.get(viewKey);
+    const hasSettledTotalForSameView =
+      viewKey && totalStore.viewKey === viewKey && isSettledTotalStatus(totalStore.status);
+
+    store.viewKey = viewKey;
+    totalStore.viewKey = viewKey;
+    totalStore.requestKey = requestKey;
+
+    if (totalEvents === 0) {
+      totalStore.totalCostCents = 0;
+      totalStore.totalEvents = 0;
+      totalStore.aggregatedEventsCount = 0;
+      totalStore.status = 'ready';
+    } else if (cachedView?.total) {
+      totalStore.totalCostCents = cachedView.total.totalCostCents ?? null;
+      totalStore.totalEvents = totalEvents;
+      totalStore.aggregatedEventsCount = cachedView.total.aggregatedEventsCount ?? 0;
+      totalStore.status = cachedView.total.status || 'ready';
+      totalStore.pageSize = cachedView.total.pageSize || totalStore.pageSize;
+    } else if (!hasSettledTotalForSameView) {
+      // Clear stale totals only when the active request actually changed.
+      totalStore.totalCostCents = null;
+      totalStore.totalEvents = totalEvents;
+      totalStore.aggregatedEventsCount = 0;
+      totalStore.status = 'loading';
+    } else {
+      totalStore.totalEvents = totalEvents;
+    }
+
+    renderTotalCost();
+
+    if (!events.length) {
+      resetState();
+      store.events = [];
+      updateViewCache();
+      return;
+    }
 
     resetState();
     store.events = events;
+    updateViewCache();
 
     watchForTableChanges();
   };
 
   const processTotalResponse = (data) => {
     if (!data || typeof data !== 'object') return;
+    if (totalStore.viewKey && data.viewKey && totalStore.viewKey !== data.viewKey) return;
+    if (totalStore.requestKey && data.requestKey && totalStore.requestKey !== data.requestKey) return;
 
+    totalStore.viewKey = data.viewKey || totalStore.viewKey || null;
+    totalStore.requestKey = data.requestKey || totalStore.requestKey || null;
     totalStore.totalCostCents = data.totalCostCents ?? null;
     totalStore.totalEvents = data.totalEvents ?? 0;
     totalStore.aggregatedEventsCount = data.aggregatedEventsCount ?? 0;
     totalStore.status = data.status || 'idle';
     totalStore.pageSize = data.pageSize || 500;
     renderTotalCost();
+    updateViewCache();
   };
 
   // Initialize

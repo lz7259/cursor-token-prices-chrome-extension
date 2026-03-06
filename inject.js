@@ -9,6 +9,7 @@
       window.__cursorTokenPricesActive = true;
 
       const AGGREGATION_PAGE_SIZE = 500;
+      const PAGINATION_KEYS = new Set(['page', 'pageSize', 'limit', 'perPage', 'take', 'count', 'offset', 'skip', 'start', 'startIndex']);
       const API_PATTERNS = [
         /get-filtered-usage-events/,
         /get-usage-events/,
@@ -88,6 +89,20 @@
         return 'fallback|' + index + '|' + JSON.stringify(event || {});
       }
 
+      function getViewKey(data, requestKey) {
+        const events = data && data.events || [];
+        const totalEvents = data && data.totalEvents || events.length;
+        const lastIndex = events.length - 1;
+
+        return JSON.stringify({
+          requestKey: requestKey || null,
+          totalEvents: totalEvents,
+          pageSize: events.length,
+          firstEvent: events.length ? getEventKey(events[0], 0) : '',
+          lastEvent: lastIndex >= 0 ? getEventKey(events[lastIndex], lastIndex) : '',
+        });
+      }
+
       function addUniqueEvents(events, seenKeys) {
         let addedEvents = 0;
         let addedCostCents = 0;
@@ -132,6 +147,48 @@
           headers,
           body: typeof body === 'string' ? body : null,
         };
+      }
+
+      function sortValue(value) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+
+        const sorted = {};
+        Object.keys(value).sort().forEach(function (key) {
+          sorted[key] = sortValue(value[key]);
+        });
+        return sorted;
+      }
+
+      function getRequestKey(requestDetails) {
+        if (!requestDetails || !requestDetails.url) return null;
+
+        const url = new URL(requestDetails.url, window.location.origin);
+        const queryEntries = [];
+        url.searchParams.forEach(function (value, key) {
+          if (PAGINATION_KEYS.has(key)) return;
+          queryEntries.push([key, value]);
+        });
+        queryEntries.sort(function (a, b) {
+          if (a[0] === b[0]) return String(a[1]).localeCompare(String(b[1]));
+          return a[0].localeCompare(b[0]);
+        });
+
+        const body = parseJson(requestDetails.body);
+        let normalizedBody = null;
+        if (body && typeof body === 'object' && !Array.isArray(body)) {
+          normalizedBody = {};
+          Object.keys(body).sort().forEach(function (key) {
+            if (PAGINATION_KEYS.has(key)) return;
+            normalizedBody[key] = sortValue(body[key]);
+          });
+        }
+
+        return JSON.stringify({
+          method: requestDetails.method || 'GET',
+          path: url.pathname,
+          query: queryEntries,
+          body: normalizedBody,
+        });
       }
 
       function getAggregationConfig(requestDetails) {
@@ -187,50 +244,63 @@
         return { url: url.toString(), options };
       }
 
-      async function aggregateTotal(originalFetch, requestDetails, baseData) {
+      async function aggregateTotal(originalFetch, requestDetails, baseData, requestKey) {
+        const runId = ++aggregationRunId;
         const totalEvents = baseData.totalEvents || baseData.events.length;
+        const effectiveRequestKey = requestKey || getRequestKey(requestDetails);
+        const effectiveViewKey = getViewKey(baseData, effectiveRequestKey);
 
         if (!totalEvents) {
+          if (runId !== aggregationRunId) return;
           dispatchTotalData({
             totalCostCents: 0,
             totalEvents: 0,
             aggregatedEventsCount: 0,
             status: 'ready',
             pageSize: AGGREGATION_PAGE_SIZE,
+            requestKey: effectiveRequestKey,
+            viewKey: effectiveViewKey,
           });
           return;
         }
 
         if (baseData.events.length >= totalEvents) {
+          if (runId !== aggregationRunId) return;
           dispatchTotalData({
             totalCostCents: baseData.totalCostCents,
             totalEvents: totalEvents,
             aggregatedEventsCount: baseData.events.length,
             status: 'ready',
             pageSize: AGGREGATION_PAGE_SIZE,
+            requestKey: effectiveRequestKey,
+            viewKey: effectiveViewKey,
           });
           return;
         }
 
         const config = getAggregationConfig(requestDetails);
         if (!config) {
+          if (runId !== aggregationRunId) return;
           dispatchTotalData({
             totalCostCents: baseData.totalCostCents,
             totalEvents: totalEvents,
             aggregatedEventsCount: baseData.events.length,
             status: 'partial',
             pageSize: AGGREGATION_PAGE_SIZE,
+            requestKey: effectiveRequestKey,
+            viewKey: effectiveViewKey,
           });
           return;
         }
 
-        const runId = ++aggregationRunId;
         dispatchTotalData({
           totalCostCents: null,
           totalEvents: totalEvents,
           aggregatedEventsCount: 0,
           status: 'loading',
           pageSize: AGGREGATION_PAGE_SIZE,
+          requestKey: effectiveRequestKey,
+          viewKey: effectiveViewKey,
         });
 
         const totalPages = Math.max(1, Math.ceil(totalEvents / AGGREGATION_PAGE_SIZE));
@@ -268,6 +338,8 @@
           aggregatedEventsCount: aggregatedEventsCount,
           status: aggregatedEventsCount >= totalEvents ? 'ready' : 'partial',
           pageSize: AGGREGATION_PAGE_SIZE,
+          requestKey: effectiveRequestKey,
+          viewKey: effectiveViewKey,
         });
       }
 
@@ -279,12 +351,20 @@
         if (isApiUrl(url)) {
           try {
             const data = extractEvents(await response.clone().json());
-            dispatchData(data);
+            let requestDetails = null;
+            let requestKey = null;
+            try {
+              requestDetails = await normalizeFetchRequest(args);
+              requestKey = getRequestKey(requestDetails);
+            } catch (e) {}
+            const viewKey = getViewKey(data, requestKey);
+
+            dispatchData({ ...data, requestKey: requestKey, viewKey: viewKey });
 
             Promise.resolve().then(async function () {
               try {
-                const requestDetails = await normalizeFetchRequest(args);
-                await aggregateTotal(originalFetch, requestDetails, data);
+                if (!requestDetails) requestDetails = await normalizeFetchRequest(args);
+                await aggregateTotal(originalFetch, requestDetails, data, requestKey);
               } catch (e) {}
             });
           } catch (e) {}
@@ -318,19 +398,24 @@
             if (xhr.readyState === 4 && xhr.status === 200) {
               try {
                 const data = extractEvents(JSON.parse(xhr.responseText));
-                dispatchData(data);
+                const requestDetails = {
+                  url: xhr._url,
+                  method: xhr._method || 'GET',
+                  headers: { ...(xhr._headers || {}) },
+                  body: xhr._body,
+                };
+                const requestKey = getRequestKey(requestDetails);
+                const viewKey = getViewKey(data, requestKey);
+
+                dispatchData({ ...data, requestKey: requestKey, viewKey: viewKey });
 
                 Promise.resolve().then(async function () {
                   try {
                     await aggregateTotal(
                       originalFetch,
-                      {
-                        url: xhr._url,
-                        method: xhr._method || 'GET',
-                        headers: { ...(xhr._headers || {}) },
-                        body: xhr._body,
-                      },
-                      data
+                      requestDetails,
+                      data,
+                      requestKey
                     );
                   } catch (e) {}
                 });
