@@ -21,12 +21,24 @@
   let processedRows = new Set();
   let observer = null;
   let retryInterval = null;
+  let loadingFallbackTimeout = null;
 
   const formatCents = (cents) => {
     if (cents == null) return '-';
     if (cents === 0) return '$0.00';
     const dollars = cents / 100;
     return dollars < 0.01 ? `$${dollars.toFixed(3)}` : `$${dollars.toFixed(2)}`;
+  };
+
+  const isUsageRoute = () => {
+    const url = new URL(window.location.href);
+    return url.pathname === '/dashboard' && url.searchParams.get('tab') === 'usage';
+  };
+
+  const hasUsageData = (data) => {
+    if (!data || typeof data !== 'object') return false;
+    if (Array.isArray(data.events) || Array.isArray(data.usageEventsDisplay)) return true;
+    return data.totalEvents != null || data.totalUsageEventsCount != null;
   };
 
   const isSettledTotalStatus = (status) => status === 'ready' || status === 'partial';
@@ -178,6 +190,11 @@
   };
 
   const renderTotalCost = () => {
+    if (!isUsageRoute()) {
+      document.querySelector('.cursor-total-cost')?.remove();
+      return;
+    }
+
     const toolbarContainer = getToolbarContainer();
     if (!toolbarContainer) return;
 
@@ -212,6 +229,34 @@
       <span class="cursor-total-cost-meta">${metaText}</span>
     `;
     totalEl.title = metaText;
+  };
+
+  const clearLoadingFallback = () => {
+    if (loadingFallbackTimeout) {
+      clearTimeout(loadingFallbackTimeout);
+      loadingFallbackTimeout = null;
+    }
+  };
+
+  const scheduleLoadingFallback = () => {
+    clearLoadingFallback();
+
+    if (totalStore.status !== 'loading' || !store.events.length) return;
+
+    const loadingViewKey = totalStore.viewKey;
+    loadingFallbackTimeout = setTimeout(() => {
+      if (totalStore.status !== 'loading' || totalStore.viewKey !== loadingViewKey) return;
+
+      totalStore.totalCostCents = store.events.reduce(
+        (sum, event) => sum + (event?.tokenUsage?.totalCents ?? 0),
+        0
+      );
+      totalStore.totalEvents = totalStore.totalEvents || store.events.length;
+      totalStore.aggregatedEventsCount = store.events.length;
+      totalStore.status = 'partial';
+      updateViewCache();
+      renderTotalCost();
+    }, 4000);
   };
 
   const getRowId = (row, index) => {
@@ -346,6 +391,7 @@
     const cachedView = viewCache.get(viewKey);
     const hasSettledTotalForSameView =
       viewKey && totalStore.viewKey === viewKey && isSettledTotalStatus(totalStore.status);
+    const shouldRender = isUsageRoute();
 
     store.viewKey = viewKey;
     totalStore.viewKey = viewKey;
@@ -372,7 +418,15 @@
       totalStore.totalEvents = totalEvents;
     }
 
-    renderTotalCost();
+    if (totalStore.status === 'loading') {
+      scheduleLoadingFallback();
+    } else {
+      clearLoadingFallback();
+    }
+
+    if (shouldRender) {
+      renderTotalCost();
+    }
 
     if (!events.length) {
       resetState();
@@ -384,6 +438,12 @@
     resetState();
     store.events = events;
     updateViewCache();
+
+    if (totalStore.status === 'loading') {
+      scheduleLoadingFallback();
+    }
+
+    if (!shouldRender) return;
 
     watchForTableChanges();
   };
@@ -400,29 +460,90 @@
     totalStore.aggregatedEventsCount = data.aggregatedEventsCount ?? 0;
     totalStore.status = data.status || 'idle';
     totalStore.pageSize = data.pageSize || 500;
-    renderTotalCost();
+    if (totalStore.status === 'loading') {
+      scheduleLoadingFallback();
+    } else if (isSettledTotalStatus(totalStore.status) || totalStore.status === 'idle') {
+      clearLoadingFallback();
+    }
     updateViewCache();
+
+    if (!isUsageRoute()) return;
+
+    renderTotalCost();
+  };
+
+  const syncUsageStateFromWindow = () => {
+    if (!isUsageRoute()) return;
+
+    if (hasUsageData(window.__cursorUsageData)) {
+      processApiResponse(window.__cursorUsageData);
+    }
+
+    if (window.__cursorUsageTotalData && typeof window.__cursorUsageTotalData === 'object') {
+      processTotalResponse(window.__cursorUsageTotalData);
+    }
+
+    if (!store.events.length) {
+      renderTotalCost();
+    }
+  };
+
+  const scheduleUsageStateSync = () => {
+    syncUsageStateFromWindow();
+    [250, 1000, 2500].forEach((delay) => {
+      setTimeout(() => {
+        syncUsageStateFromWindow();
+      }, delay);
+    });
+  };
+
+  let lastUrl = window.location.href;
+  const handleRouteChange = () => {
+    const nextUrl = window.location.href;
+    if (nextUrl === lastUrl) return;
+    lastUrl = nextUrl;
+
+    if (!isUsageRoute()) {
+      document.querySelector('.cursor-total-cost')?.remove();
+      return;
+    }
+
+    scheduleUsageStateSync();
+  };
+
+  const patchHistoryMethod = (methodName) => {
+    const original = window.history[methodName];
+    window.history[methodName] = function (...args) {
+      const result = original.apply(this, args);
+      queueMicrotask(handleRouteChange);
+      return result;
+    };
   };
 
   // Initialize
   window.addEventListener('cursor-usage-data', (e) => processApiResponse(e.detail));
   window.addEventListener('cursor-usage-total-data', (e) => processTotalResponse(e.detail));
+  window.addEventListener('popstate', handleRouteChange);
+  window.addEventListener('hashchange', handleRouteChange);
+  patchHistoryMethod('pushState');
+  patchHistoryMethod('replaceState');
 
   if (window.__cursorUsageTotalData) {
     processTotalResponse(window.__cursorUsageTotalData);
   }
 
-  if (window.__cursorUsageData?.events?.length) {
+  if (hasUsageData(window.__cursorUsageData)) {
     processApiResponse(window.__cursorUsageData);
     return;
   }
 
   const interval = setInterval(() => {
-    if (window.__cursorUsageData?.events?.length) {
+    if (hasUsageData(window.__cursorUsageData)) {
       processApiResponse(window.__cursorUsageData);
       clearInterval(interval);
     }
   }, 500);
 
   setTimeout(() => clearInterval(interval), 30000);
+  scheduleUsageStateSync();
 })();
