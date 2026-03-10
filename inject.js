@@ -80,8 +80,14 @@
           events,
           totalEvents: extractTotalEvents(data, events.length),
           totalCostCents: events.reduce((sum, e) => sum + (e.tokenUsage && e.tokenUsage.totalCents || 0), 0),
+          displayedTotalCostCents: events.reduce((sum, e) => sum + getDisplayedCostCents(e && e.tokenUsage && e.tokenUsage.totalCents || 0), 0),
           lastUpdated: new Date(),
         };
+      }
+
+      function getDisplayedCostCents(cents) {
+        if (cents == null) return 0;
+        return cents < 1 ? Math.round(cents * 10) / 10 : Math.round(cents);
       }
 
       function getEventKey(event, index) {
@@ -184,16 +190,19 @@
       function addUniqueEvents(events, seenKeys) {
         let addedEvents = 0;
         let addedCostCents = 0;
+        let addedDisplayedCostCents = 0;
 
         events.forEach(function (event, index) {
           const key = getEventKey(event, index);
           if (seenKeys.has(key)) return;
           seenKeys.add(key);
           addedEvents += 1;
-          addedCostCents += event && event.tokenUsage && event.tokenUsage.totalCents || 0;
+          const totalCents = event && event.tokenUsage && event.tokenUsage.totalCents || 0;
+          addedCostCents += totalCents;
+          addedDisplayedCostCents += getDisplayedCostCents(totalCents);
         });
 
-        return { addedEvents, addedCostCents };
+        return { addedEvents, addedCostCents, addedDisplayedCostCents };
       }
 
       function dispatchData(data) {
@@ -216,6 +225,7 @@
           aggregatedEventsCount: data && data.aggregatedEventsCount || 0,
           totalEvents: data && data.totalEvents || 0,
           totalCostCents: data && data.totalCostCents != null ? data.totalCostCents : null,
+          displayedTotalCostCents: data && data.displayedTotalCostCents != null ? data.displayedTotalCostCents : null,
         });
         window.dispatchEvent(new CustomEvent('cursor-usage-total-data', { detail: data }));
       }
@@ -352,6 +362,7 @@
           if (runId !== aggregationRunId) return;
           dispatchTotalData({
             totalCostCents: 0,
+            displayedTotalCostCents: 0,
             totalEvents: 0,
             aggregatedEventsCount: 0,
             status: 'ready',
@@ -368,6 +379,7 @@
           if (runId !== aggregationRunId) return;
           dispatchTotalData({
             totalCostCents: baseData.totalCostCents,
+            displayedTotalCostCents: baseData.displayedTotalCostCents,
             totalEvents: totalEvents,
             aggregatedEventsCount: baseData.events.length,
             status: 'ready',
@@ -385,6 +397,7 @@
           if (runId !== aggregationRunId) return;
           dispatchTotalData({
             totalCostCents: baseData.totalCostCents,
+            displayedTotalCostCents: baseData.displayedTotalCostCents,
             totalEvents: totalEvents,
             aggregatedEventsCount: baseData.events.length,
             status: 'partial',
@@ -399,6 +412,7 @@
 
         dispatchTotalData({
           totalCostCents: null,
+          displayedTotalCostCents: null,
           totalEvents: totalEvents,
           aggregatedEventsCount: 0,
           status: 'loading',
@@ -412,6 +426,7 @@
         const totalPages = Math.max(1, Math.ceil(totalEvents / AGGREGATION_PAGE_SIZE));
         const seenKeys = new Set();
         let totalCostCents = 0;
+        let displayedTotalCostCents = 0;
         let aggregatedEventsCount = 0;
 
         for (let pageIndex = 0; pageIndex < totalPages; pageIndex += 1) {
@@ -429,6 +444,7 @@
             const added = addUniqueEvents(pageData.events, seenKeys);
             aggregatedEventsCount += added.addedEvents;
             totalCostCents += added.addedCostCents;
+            displayedTotalCostCents += added.addedDisplayedCostCents;
 
             if (pageData.events.length < AGGREGATION_PAGE_SIZE) break;
           } catch (e) {
@@ -446,6 +462,7 @@
 
         dispatchTotalData({
           totalCostCents: totalCostCents,
+          displayedTotalCostCents: displayedTotalCostCents,
           totalEvents: totalEvents,
           aggregatedEventsCount: aggregatedEventsCount,
           status: aggregatedEventsCount >= totalEvents ? 'ready' : 'partial',

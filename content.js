@@ -8,6 +8,7 @@
   };
   const totalStore = {
     totalCostCents: null,
+    displayedTotalCostCents: null,
     totalEvents: 0,
     aggregatedEventsCount: 0,
     status: 'idle',
@@ -50,6 +51,14 @@
     return dollars < 0.01 ? `$${dollars.toFixed(3)}` : `$${dollars.toFixed(2)}`;
   };
 
+  const getDisplayedCostCents = (cents) => {
+    if (cents == null) return 0;
+    return cents < 1 ? Math.round(cents * 10) / 10 : Math.round(cents);
+  };
+
+  const getDisplayedTotalCostCentsFromEvents = (events) =>
+    events.reduce((sum, event) => sum + getDisplayedCostCents(event?.tokenUsage?.totalCents ?? 0), 0);
+
   const isUsageRoute = () => {
     const url = new URL(window.location.href);
     return url.pathname === '/dashboard' && url.searchParams.get('tab') === 'usage';
@@ -58,7 +67,13 @@
   const hasUsageData = (data) => {
     if (!data || typeof data !== 'object') return false;
     if (Array.isArray(data.events) || Array.isArray(data.usageEventsDisplay)) return true;
-    return data.totalEvents != null || data.totalUsageEventsCount != null;
+
+    const requestPath = getRequestPathFromKey(data.requestKey);
+    if (isUsageEventsRequestPath(requestPath)) {
+      return data.totalEvents != null || data.totalUsageEventsCount != null;
+    }
+
+    return false;
   };
 
   const isSettledTotalStatus = (status) => status === 'ready' || status === 'partial';
@@ -220,6 +235,7 @@
     if (isSettledTotalStatus(totalStore.status)) {
       next.total = {
         totalCostCents: totalStore.totalCostCents,
+        displayedTotalCostCents: totalStore.displayedTotalCostCents,
         totalEvents: totalStore.totalEvents,
         aggregatedEventsCount: totalStore.aggregatedEventsCount,
         status: totalStore.status,
@@ -255,6 +271,7 @@
 
     if (cached.total) {
       totalStore.totalCostCents = cached.total.totalCostCents ?? null;
+      totalStore.displayedTotalCostCents = cached.total.displayedTotalCostCents ?? null;
       totalStore.totalEvents = cached.total.totalEvents ?? 0;
       totalStore.aggregatedEventsCount = cached.total.aggregatedEventsCount ?? 0;
       totalStore.status = cached.total.status || 'ready';
@@ -262,6 +279,7 @@
       clearLoadingFallback();
     } else {
       totalStore.totalCostCents = null;
+      totalStore.displayedTotalCostCents = null;
       totalStore.totalEvents = 0;
       totalStore.aggregatedEventsCount = 0;
       totalStore.status = 'loading';
@@ -286,44 +304,70 @@
 
   const renderTotalCost = () => {
     if (!isUsageRoute()) {
-      document.querySelector('.cursor-total-cost')?.remove();
+      document.querySelectorAll('.cursor-total-costs').forEach((el) => el.remove());
       return;
     }
 
-    const toolbarContainer = getToolbarContainer();
-    if (!toolbarContainer) return;
-
-    let totalEl = toolbarContainer.querySelector('.cursor-total-cost');
     const shouldShow =
       totalStore.status === 'loading' ||
       totalStore.status === 'partial' ||
       (totalStore.status === 'ready' && totalStore.totalCostCents != null);
 
     if (!shouldShow) {
-      totalEl?.remove();
+      document.querySelectorAll('.cursor-total-costs').forEach((el) => el.remove());
       return;
     }
 
-    if (!totalEl) {
-      totalEl = document.createElement('div');
-      totalEl.className = 'cursor-total-cost';
-      toolbarContainer.insertBefore(totalEl, toolbarContainer.lastElementChild || null);
-    }
+    document.querySelectorAll('.cursor-total-costs').forEach((el) => el.remove());
 
-    const valueText = totalStore.status === 'loading' ? 'Calculating...' : formatCents(totalStore.totalCostCents);
-    const metaText =
-      totalStore.status === 'loading'
+    const toolbarContainer = getToolbarContainer();
+    if (!toolbarContainer) return;
+
+    const totalsEl = document.createElement('div');
+    totalsEl.className = 'cursor-total-costs';
+    toolbarContainer.insertBefore(totalsEl, toolbarContainer.lastElementChild || null);
+
+    const isLoading = totalStore.status === 'loading';
+    const hasPartialFromEvents = isLoading && store.events.length > 0;
+    const exactCents = hasPartialFromEvents
+      ? store.events.reduce((sum, e) => sum + (e?.tokenUsage?.totalCents ?? 0), 0)
+      : totalStore.totalCostCents;
+    const displayedCents = hasPartialFromEvents
+      ? getDisplayedTotalCostCentsFromEvents(store.events)
+      : totalStore.displayedTotalCostCents;
+
+    const exactValueText = isLoading && !hasPartialFromEvents ? 'Calculating...' : formatCents(exactCents);
+    const exactMetaText =
+      isLoading && !hasPartialFromEvents
         ? `Fetching totals in ${totalStore.pageSize}-row pages`
-        : totalStore.status === 'partial'
-          ? `Summed ${totalStore.aggregatedEventsCount.toLocaleString()} of ${totalStore.totalEvents.toLocaleString()} requests`
-          : `Summed ${totalStore.aggregatedEventsCount.toLocaleString()} requests`;
+        : hasPartialFromEvents
+          ? `Summed ${store.events.length.toLocaleString()} requests (loading…)`
+          : totalStore.status === 'partial'
+            ? `Summed ${totalStore.aggregatedEventsCount.toLocaleString()} of ${totalStore.totalEvents.toLocaleString()} requests`
+            : `Summed ${totalStore.aggregatedEventsCount.toLocaleString()} requests`;
+    const displayedValueText = isLoading && !hasPartialFromEvents ? 'Calculating...' : formatCents(displayedCents);
+    const displayedMetaText =
+      isLoading && !hasPartialFromEvents
+        ? 'Adds each request after row-level rounding'
+        : hasPartialFromEvents
+          ? `Rounded per request across ${store.events.length.toLocaleString()} requests (loading…)`
+          : totalStore.status === 'partial'
+            ? `Rounded per request across ${totalStore.aggregatedEventsCount.toLocaleString()} of ${totalStore.totalEvents.toLocaleString()} requests`
+            : `Rounded per request across ${totalStore.aggregatedEventsCount.toLocaleString()} requests`;
 
-    totalEl.innerHTML = `
-      <span class="cursor-total-cost-label">Total cost</span>
-      <span class="cursor-total-cost-value">${valueText}</span>
-      <span class="cursor-total-cost-meta">${metaText}</span>
+    totalsEl.innerHTML = `
+      <div class="cursor-total-cost">
+        <span class="cursor-total-cost-label">Exact total</span>
+        <span class="cursor-total-cost-value">${exactValueText}</span>
+        <span class="cursor-total-cost-meta">${exactMetaText}</span>
+      </div>
+      <div class="cursor-total-cost">
+        <span class="cursor-total-cost-label">Displayed request sum</span>
+        <span class="cursor-total-cost-value">${displayedValueText}</span>
+        <span class="cursor-total-cost-meta">${displayedMetaText}</span>
+      </div>
     `;
-    totalEl.title = metaText;
+    totalsEl.title = `${exactMetaText}\n${displayedMetaText}`;
   };
 
   const clearLoadingFallback = () => {
@@ -353,6 +397,7 @@
         (sum, event) => sum + (event?.tokenUsage?.totalCents ?? 0),
         0
       );
+      totalStore.displayedTotalCostCents = getDisplayedTotalCostCentsFromEvents(store.events);
       totalStore.totalEvents = totalStore.totalEvents || store.events.length;
       totalStore.aggregatedEventsCount = store.events.length;
       totalStore.status = 'partial';
@@ -500,7 +545,10 @@
     const totalEvents = data.totalEvents ?? events.length;
     const requestId = data.requestId ?? null;
     const requestKey = data.requestKey || null;
+    const requestPath = getRequestPathFromKey(requestKey);
     const viewKey = getViewKey(data, events, totalEvents);
+    const isUsageEventsPayload = isUsageEventsRequestPath(requestPath);
+    const isExplicitEmptyUsagePayload = isUsageEventsPayload && totalEvents === 0 && events.length === 0;
     if (requestId != null && requestId < minAcceptedRequestId) {
       debugLog('api:reject-old-request', {
         requestId,
@@ -525,6 +573,14 @@
     if (pendingPresetSignature && data.filterSignature === pendingPresetSignature) {
       clearPresetLock('api-response');
     }
+    if (!events.length && totalEvents === 0 && !isExplicitEmptyUsagePayload) {
+      debugLog('api:ignore-empty-non-events-payload', {
+        requestId,
+        requestPath,
+        filterSignature: data.filterSignature || null,
+      });
+      return;
+    }
     debugLog('api:accept', {
       requestId,
       requestKey,
@@ -541,12 +597,14 @@
 
     if (totalEvents === 0) {
       totalStore.totalCostCents = 0;
+      totalStore.displayedTotalCostCents = 0;
       totalStore.totalEvents = 0;
       totalStore.aggregatedEventsCount = 0;
       totalStore.status = 'ready';
     } else if (!hasSettledTotalForSameRequest) {
       // Clear stale totals only when the active request actually changed.
       totalStore.totalCostCents = null;
+      totalStore.displayedTotalCostCents = null;
       totalStore.totalEvents = totalEvents;
       totalStore.aggregatedEventsCount = 0;
       totalStore.status = 'loading';
@@ -641,6 +699,7 @@
       filterSignature: currentFilterSignature,
       status: data.status || null,
       totalCostCents: data.totalCostCents != null ? data.totalCostCents : null,
+      displayedTotalCostCents: data.displayedTotalCostCents != null ? data.displayedTotalCostCents : null,
       aggregatedEventsCount: data.aggregatedEventsCount ?? 0,
       totalEvents: data.totalEvents ?? 0,
     });
@@ -649,6 +708,7 @@
     totalStore.viewKey = data.viewKey || totalStore.viewKey || null;
     totalStore.requestKey = data.requestKey || totalStore.requestKey || null;
     totalStore.totalCostCents = data.totalCostCents ?? null;
+    totalStore.displayedTotalCostCents = data.displayedTotalCostCents ?? null;
     totalStore.totalEvents = data.totalEvents ?? 0;
     totalStore.aggregatedEventsCount = data.aggregatedEventsCount ?? 0;
     totalStore.status = data.status || 'idle';
@@ -799,6 +859,7 @@
       resetState();
       store.events = [];
       totalStore.totalCostCents = null;
+      totalStore.displayedTotalCostCents = null;
       totalStore.totalEvents = 0;
       totalStore.aggregatedEventsCount = 0;
       totalStore.status = 'loading';
@@ -849,7 +910,7 @@
     lastUrl = nextUrl;
 
     if (!isUsageRoute()) {
-      document.querySelector('.cursor-total-cost')?.remove();
+      document.querySelector('.cursor-total-costs')?.remove();
       return;
     }
 
@@ -863,6 +924,7 @@
       store.events = [];
       store.viewKey = null;
       totalStore.totalCostCents = null;
+      totalStore.displayedTotalCostCents = null;
       totalStore.totalEvents = 0;
       totalStore.aggregatedEventsCount = 0;
       totalStore.status = 'loading';

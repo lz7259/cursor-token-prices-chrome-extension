@@ -27,6 +27,12 @@
   background: var(--bg-elevated, rgba(15, 23, 42, 0.04));
 }
 
+.cursor-total-costs {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .cursor-total-cost-label {
   color: var(--text-tertiary, #64748b);
   font-size: 11px;
@@ -54,7 +60,7 @@
   }
 
   .cursor-total-cost {
-    width: 100%;
+    flex: 1 1 100%;
     min-width: 0;
   }
 }
